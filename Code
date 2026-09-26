@@ -1,0 +1,896 @@
+The project uses TypeScript/TSX, CSS, HTML, JavaScript, JSON, YAML, TOML, SVG
+
+export type Vessel = 'flask' | 'beaker' | 'beaker-2' | 'test-tube';
+export type Reagent = 'acid' | 'alkali' | 'indicator' | 'copper' | 'silver' | 'salt' | 'bicarb';
+export type Portion = Partial<Record<Reagent, number>>;
+export const VESSEL_CAPACITY: Record<Vessel, number> = { flask: 12, beaker: 10, 'beaker-2': 10, 'test-tube': 5 };
+export const PIPETTE_CAPACITY = 3;
+const REAGENTS: Reagent[] = ['acid', 'alkali', 'indicator', 'copper', 'silver', 'salt', 'bicarb'];
+
+export function reagentPortion(reagent: Reagent): Portion {
+  return { [reagent]: 1 };
+}
+
+// Each unit represents a virtual aliquot. Sharing the average composition
+// across units keeps decanting and pipette samples representative of the mixture.
+export function mixPortions(contents: Portion[]): Portion[] {
+  if (!contents.length) return [];
+  const average: Portion = {};
+  for (const reagent of REAGENTS) {
+    const total = contents.reduce((sum, portion) => sum + (portion[reagent] ?? 0), 0);
+    if (total > 0) average[reagent] = total / contents.length;
+  }
+  return Array.from({ length: contents.length }, () => ({ ...average }));
+}
+
+export function availableSpace(vessel: Vessel, contents: Portion[]): number {
+  return Math.max(0, VESSEL_CAPACITY[vessel] - contents.length);
+}
+
+export type Reaction = {
+  label: string;
+  explanation: string;
+  color: string;
+  gas: boolean;
+  precipitate: boolean;
+  fizz: boolean;
+};
+
+// Intentionally simplified observations, not a quantitative chemistry model.
+export function describeReaction(contents: Portion[]): Reaction {
+  const count = (kind: Reagent) => contents.reduce((sum, portion) => sum + (portion[kind] ?? 0), 0);
+  const has = (kind: Reagent) => count(kind) > .01;
+  if (has('silver') && has('salt')) return {
+    label: 'White precipitate',
+    explanation: 'Silver and chloride ions form an insoluble solid (silver chloride).',
+    color: '#dce6e2', gas: false, precipitate: true, fizz: false,
+  };
+  if (has('acid') && has('bicarb')) return {
+    label: 'Carbon dioxide bubbling',
+    explanation: 'Acid and bicarbonate release carbon dioxide gas. The bubbles are visible in the vessel.',
+    color: '#edc998', gas: true, precipitate: false, fizz: true,
+  };
+  if (has('indicator') && has('alkali')) {
+    const alkaline = count('alkali') > count('acid') + .01;
+    return {
+      label: alkaline ? 'Indicator turns pink' : 'Indicator turns clear',
+      explanation: alkaline
+        ? 'In this simplified model, phenolphthalein appears pink while the mixture is alkaline. Add acid to see it fade.'
+        : 'The simulated mixture is no longer alkaline enough for phenolphthalein to stay pink.',
+      color: alkaline ? '#ef6aa9' : '#e5cfda',
+      gas: false, precipitate: false, fizz: false,
+    };
+  }
+  if (has('acid') && has('alkali')) return {
+    label: 'Acid and alkali mixed',
+    explanation: 'The acid and alkali neutralize in this simplified model; no gas is produced by this pair.',
+    color: '#b5d5ce', gas: false, precipitate: false, fizz: false,
+  };
+  if (has('copper')) return {
+    label: 'Blue solution',
+    explanation: 'Copper(II) sulfate gives the solution its characteristic blue appearance.',
+    color: '#267fd2', gas: false, precipitate: false, fizz: false,
+  };
+  if (has('indicator')) return {
+    label: 'Indicator remains clear',
+    explanation: 'Phenolphthalein is clear until the simulated mixture becomes alkaline.',
+    color: '#d9e3df', gas: false, precipitate: false, fizz: false,
+  };
+  return {
+    label: contents.length ? 'Solution prepared' : 'Empty vessel',
+    explanation: contents.length ? 'The reagents are mixed; no distinctive reaction is shown for this combination.' : 'Add a reagent to observe a change.',
+    color: contents.length && has('acid') ? '#e5caa9' : '#8ac8c6',
+    gas: false, precipitate: false, fizz: false,
+  };
+}
+
+export function isRunaway(contents: Portion[], temperature: number): boolean {
+  // A theatrical sandbox event for diverse mixtures heated well past the normal range.
+  // It is not a claim that these real-world chemicals would explode together.
+  const ingredients = REAGENTS.filter(reagent => contents.some(portion => (portion[reagent] ?? 0) > .01));
+  return temperature >= 130 && ingredients.length >= 3 && contents.length >= 4;
+}
+
+import Lab3D from './Lab3D';
+
+export default function App() {
+  return <Lab3D />;
+}
+
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { KeyboardControls, PointerLockControls, useKeyboardControls } from '@react-three/drei';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import * as THREE from 'three';
+import { Atom, Beaker, FlaskConical, Footprints, Hand, MousePointer2, RotateCcw } from 'lucide-react';
+import { availableSpace, describeReaction, isRunaway, mixPortions, PIPETTE_CAPACITY, reagentPortion, VESSEL_CAPACITY, type Portion, type Reagent, type Vessel } from './lab-reactions';
+import './vr-lab.css';
+
+type Kind = Vessel | Reagent | 'pipette';
+type Item = { id: Kind; name: string; color: string; shelf: [number, number, number] };
+type Position = { location: 'shelf' | 'bench' | 'held'; point: [number, number, number] };
+type Target = { type: 'item'; id: Kind } | { type: 'bench'; point: [number, number, number]; bounds: [number, number, number, number] } | { type: 'hotplate' } | { type: 'waste' };
+
+const ITEMS: Item[] = [
+  { id: 'flask', name: 'Erlenmeyer flask', color: '#d5f2ee', shelf: [-6.2, 1.43, -10.4] },
+  { id: 'beaker', name: 'Glass beaker A', color: '#d5f2ee', shelf: [-5.1, 1.40, -10.4] },
+  { id: 'beaker-2', name: 'Glass beaker B', color: '#d5f2ee', shelf: [-4, 1.40, -10.4] },
+  { id: 'test-tube', name: 'Test tube', color: '#d5f2ee', shelf: [-2.9, 1.43, -10.4] },
+  { id: 'pipette', name: 'Graduated pipette', color: '#d5f2ee', shelf: [-1.8, 1.21, -10.4] },
+  { id: 'acid', name: 'Hydrochloric acid', color: '#f0a34c', shelf: [-.7, 1.4, -10.4] },
+  { id: 'alkali', name: 'Sodium hydroxide', color: '#4ba7d1', shelf: [.4, 1.4, -10.4] },
+  { id: 'indicator', name: 'Phenolphthalein', color: '#d95b9f', shelf: [1.5, 1.4, -10.4] },
+  { id: 'copper', name: 'Copper(II) sulfate', color: '#1d75c9', shelf: [2.6, 1.4, -10.4] },
+  { id: 'silver', name: 'Silver nitrate', color: '#dfe7e8', shelf: [3.7, 1.4, -10.4] },
+  { id: 'salt', name: 'Sodium chloride', color: '#f3f1e7', shelf: [4.8, 1.4, -10.4] },
+  { id: 'bicarb', name: 'Sodium bicarbonate', color: '#f0e3b8', shelf: [5.9, 1.4, -10.4] },
+];
+const LOOKUP = Object.fromEntries(ITEMS.map(item => [item.id, item])) as Record<Kind, Item>;
+const REAGENTS: Reagent[] = ['acid', 'alkali', 'indicator', 'copper', 'silver', 'salt', 'bicarb'];
+const FORMULAS: Record<Reagent, string> = {
+  acid: 'HCl', alkali: 'NaOH', indicator: 'IND', copper: 'CuSO₄',
+  silver: 'AgNO₃', salt: 'NaCl', bicarb: 'NaHCO₃',
+};
+const VESSELS: Vessel[] = ['flask', 'beaker', 'beaker-2', 'test-tube'];
+function portionNames(portion: Portion): string {
+  return REAGENTS.filter(id => (portion[id] ?? 0) > .01).map(id => LOOKUP[id].name).join(' + ');
+}
+const BENCH_Y = 1.03;
+const BENCH_Z = -1.4;
+const CONTROLS = [
+  { name: 'forward', keys: ['ArrowUp', 'KeyW'] }, { name: 'back', keys: ['ArrowDown', 'KeyS'] },
+  { name: 'left', keys: ['ArrowLeft', 'KeyA'] }, { name: 'right', keys: ['ArrowRight', 'KeyD'] },
+  { name: 'sprint', keys: ['ShiftLeft', 'ShiftRight'] },
+];
+
+function initialPositions(): Record<Kind, Position> {
+  return Object.fromEntries(ITEMS.map(item => [item.id, { location: 'shelf', point: item.shelf }])) as Record<Kind, Position>;
+}
+
+function reagentColor(contents: Portion[]): string {
+  return describeReaction(contents).color;
+}
+
+function ReactionEffects({ kind, contents, temperature }: { kind: Vessel; contents: Portion[]; temperature: number }) {
+  const particles = useRef<THREE.Group>(null);
+  const reaction = describeReaction(contents);
+  const active = reaction.fizz || (temperature > 75 && contents.length > 0);
+  useFrame(({ clock }) => {
+    if (!particles.current || !active) return;
+    particles.current.children.forEach((child, index) => {
+      child.position.y = -.22 + ((clock.elapsedTime * (reaction.fizz ? .62 : .32) + index * .17) % .58);
+    });
+  });
+  return <>
+    {reaction.precipitate && <mesh position={[0, -.3, 0]}>
+      <cylinderGeometry args={[kind === 'test-tube' ? .062 : .2, kind === 'test-tube' ? .062 : .22, .07, 18]} />
+      <meshStandardMaterial color="#f4f4e8" />
+    </mesh>}
+    {active && <group ref={particles}>
+      {Array.from({ length: 7 }, (_, index) => <mesh key={index}
+        position={[Math.sin(index * 3) * (kind === 'test-tube' ? .035 : .15), 0, Math.cos(index * 2) * (kind === 'test-tube' ? .03 : .13)]}>
+        <sphereGeometry args={[kind === 'test-tube' ? .017 : .03, 8, 6]} />
+        <meshStandardMaterial color={temperature > 85 ? '#f2f0df' : '#e9f8f6'} transparent opacity={.7} />
+      </mesh>)}
+    </group>}
+  </>;
+}
+
+function Glassware({ kind, contents = [], sample = [], temperature = 22 }: {
+  kind: Vessel | 'pipette'; contents?: Portion[]; sample?: Portion[]; temperature?: number;
+}) {
+  const color = reagentColor(contents);
+  if (kind === 'pipette') return (
+    <group rotation={[0, 0, Math.PI / 2]}>
+      <mesh><cylinderGeometry args={[.045, .045, .78, 12]} /><meshPhysicalMaterial color="#d9efec" transparent opacity={.7} roughness={.13} /></mesh>
+      <mesh position={[0, -.44, 0]}><coneGeometry args={[.06, .21, 12]} /><meshPhysicalMaterial color="#d9efec" transparent opacity={.7} /></mesh>
+      <mesh position={[0, .48, 0]}><sphereGeometry args={[.11, 12, 10]} /><meshStandardMaterial color="#df996b" /></mesh>
+      {Array.from({ length: PIPETTE_CAPACITY }, (_, index) => <mesh key={index} position={[.05, -.24 + index * .12, 0]}>
+        <boxGeometry args={[.018, .012, .012]} /><meshBasicMaterial color="#2e5d62" />
+      </mesh>)}
+      {sample.length > 0 && <mesh position={[0, -.34 + .06 * sample.length, 0]}>
+        <cylinderGeometry args={[.028, .028, .12 * sample.length, 10]} />
+        <meshStandardMaterial color={reagentColor(sample)} emissive={reagentColor(sample)} emissiveIntensity={.15} />
+      </mesh>}
+    </group>
+  );
+  return (
+    <group>
+      {kind === 'flask' ? (
+        <>
+          <mesh position={[0, -.07, 0]}><cylinderGeometry args={[.13, .34, .56, 24, 1, true]} /><meshPhysicalMaterial color="#b4dedb" transparent opacity={.5} side={THREE.DoubleSide} roughness={.08} /></mesh>
+          <mesh position={[0, .31, 0]}><cylinderGeometry args={[.13, .13, .24, 20, 1, true]} /><meshPhysicalMaterial color="#b4dedb" transparent opacity={.5} side={THREE.DoubleSide} /></mesh>
+        </>
+      ) : <mesh><cylinderGeometry args={kind === 'test-tube' ? [.085, .07, .62, 16, 1, true] : [.31, .29, .58, 24, 1, true]} /><meshPhysicalMaterial color="#b4dedb" transparent opacity={.55} side={THREE.DoubleSide} roughness={.08} /></mesh>}
+      {(kind === 'beaker' || kind === 'beaker-2') && <mesh position={[0, .29, 0]} rotation={[Math.PI / 2, 0, 0]}>
+        <torusGeometry args={[.31, .012, 8, 24]} />
+        <meshStandardMaterial color={kind === 'beaker' ? '#7bcfc3' : '#efd18a'} />
+      </mesh>}
+      {contents.length > 0 && <mesh position={[0, -.29 + (.08 + contents.length / VESSEL_CAPACITY[kind] * .38) / 2, 0]}>
+        <cylinderGeometry args={[kind === 'flask' ? .22 : kind === 'test-tube' ? .061 : .27, kind === 'test-tube' ? .061 : .27, .08 + contents.length / VESSEL_CAPACITY[kind] * .38, 24]} />
+        <meshStandardMaterial color={color} transparent opacity={.88} />
+      </mesh>}
+      {Array.from({ length: 4 }, (_, index) => <mesh key={index} position={[kind === 'test-tube' ? .086 : .305, -.2 + index * .11, 0]}>
+        <boxGeometry args={[.045, .008, .009]} /><meshBasicMaterial color="#e9f5f0" transparent opacity={.8} />
+      </mesh>)}
+      <ReactionEffects kind={kind} contents={contents} temperature={temperature} />
+    </group>
+  );
+}
+
+function Bottle({ item, remaining }: { item: Item; remaining: number }) {
+  const label = useMemo(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 512; canvas.height = 320;
+    const context = canvas.getContext('2d');
+    if (context) {
+      context.fillStyle = '#faf8ec'; context.fillRect(0, 0, 512, 320);
+      context.fillStyle = item.color; context.fillRect(0, 0, 512, 42);
+      context.fillStyle = '#203335'; context.textAlign = 'center';
+      context.font = 'bold 96px Arial'; context.fillText(FORMULAS[item.id as Reagent], 256, 157);
+      context.font = 'bold 28px Arial'; context.fillText(item.name.toUpperCase(), 256, 221, 480);
+      context.font = '20px Arial'; context.fillText('SIMULATED REAGENT', 256, 273);
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    return texture;
+  }, [item]);
+  useEffect(() => () => label.dispose(), [label]);
+  return <group>
+    <mesh><cylinderGeometry args={[.23, .25, .62, 18]} /><meshPhysicalMaterial color="#bed7d5" transparent opacity={.46} roughness={.2} /></mesh>
+    {remaining > 0 && <mesh position={[0, -.21 + .21 * remaining / 10, 0]}><cylinderGeometry args={[.19, .21, .42 * remaining / 10, 18]} /><meshStandardMaterial color={item.color} transparent opacity={.86} /></mesh>}
+    <mesh position={[0, .38, 0]}><cylinderGeometry args={[.13, .13, .18, 18]} /><meshStandardMaterial color="#e8e5da" /></mesh>
+    <mesh position={[0, .01, .251]}><planeGeometry args={[.39, .245]} /><meshBasicMaterial map={label} side={THREE.DoubleSide} /></mesh>
+  </group>;
+}
+
+function LabObject({ item, point, contents, sample, remaining, temperature }: {
+  item: Item; point: [number, number, number]; contents: Portion[]; sample: Portion[]; remaining: number; temperature: number;
+}) {
+  return <group position={point} userData={{ labTarget: { type: 'item', id: item.id } }}>
+    {REAGENTS.includes(item.id as Reagent)
+      ? <Bottle item={item} remaining={remaining} />
+      : <Glassware kind={item.id as Vessel | 'pipette'} contents={contents} sample={sample} temperature={temperature} />}
+  </group>;
+}
+
+function Bench({ x, z, width, depth }: {
+  x: number; z: number; width: number; depth: number;
+}) {
+  return <group position={[x, 0, z]}>
+    <mesh position={[0, .95, 0]} receiveShadow userData={{ labTarget: { type: 'bench', bounds: [x - width / 2 + .32, x + width / 2 - .32, z - depth / 2 + .32, z + depth / 2 - .32] } }}>
+      <boxGeometry args={[width, .16, depth]} /><meshStandardMaterial color={x === 0 ? '#43585a' : '#526467'} roughness={.45} />
+    </mesh>
+    {[-1, 1].map(a => [-1, 1].map(b => <mesh key={`${a}-${b}`} position={[a * (width / 2 - .23), .45, b * (depth / 2 - .23)]}>
+      <boxGeometry args={[.16, .9, .16]} /><meshStandardMaterial color="#273638" />
+    </mesh>))}
+    <mesh position={[0, .45, 0]}><boxGeometry args={[width - .3, .72, depth - .3]} /><meshStandardMaterial color="#d4d8d4" /></mesh>
+  </group>;
+}
+
+function Stand({ x, z }: { x: number; z: number }) {
+  return <group position={[x, BENCH_Y, z]}>
+    <mesh position={[0, .06, 0]}><boxGeometry args={[.65, .12, .42]} /><meshStandardMaterial color="#27393a" metalness={.3} /></mesh>
+    <mesh position={[0, .65, 0]}><cylinderGeometry args={[.035, .035, 1.2, 12]} /><meshStandardMaterial color="#8b9a99" metalness={.8} /></mesh>
+    <mesh position={[.3, 1, 0]}><boxGeometry args={[.6, .04, .05]} /><meshStandardMaterial color="#8b9a99" metalness={.7} /></mesh>
+    <mesh position={[.57, 1, 0]}><torusGeometry args={[.13, .025, 8, 20]} /><meshStandardMaterial color="#8b9a99" metalness={.7} /></mesh>
+  </group>;
+}
+
+function Rack({ x, z }: { x: number; z: number }) {
+  return <group position={[x, BENCH_Y, z]}>
+    <mesh position={[0, .08, 0]}><boxGeometry args={[.85, .14, .32]} /><meshStandardMaterial color="#bf744a" /></mesh>
+    <mesh position={[0, .26, 0]}><boxGeometry args={[.85, .08, .32]} /><meshStandardMaterial color="#d99864" /></mesh>
+    {[-.28, -.09, .1, .29].map(a => <mesh key={a} position={[a, .38, 0]}><cylinderGeometry args={[.05, .05, .2, 12]} /><meshPhysicalMaterial color="#b6d6d4" transparent opacity={.55} /></mesh>)}
+  </group>;
+}
+
+function Room({ hotplateOn, mishap }: { hotplateOn: boolean; mishap: boolean }) {
+  return <>
+    <color attach="background" args={['#a9b4b0']} />
+    <fog attach="fog" args={['#bfc7c2', 17, 32]} />
+    <ambientLight intensity={1.15} />
+    <hemisphereLight color="#f9f4df" groundColor="#334749" intensity={1.1} />
+    <directionalLight position={[4, 10, 5]} intensity={1.8} />
+    <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow><planeGeometry args={[18, 24]} /><meshStandardMaterial color="#aab1ad" /></mesh>
+    <mesh position={[0, 3, -12]}><boxGeometry args={[18, 6, .2]} /><meshStandardMaterial color="#d9ded9" /></mesh>
+    <mesh position={[-9, 3, 0]}><boxGeometry args={[.2, 6, 24]} /><meshStandardMaterial color="#cbd3cf" /></mesh>
+    <mesh position={[9, 3, 0]}><boxGeometry args={[.2, 6, 24]} /><meshStandardMaterial color="#cbd3cf" /></mesh>
+    <mesh position={[0, 6, 0]}><boxGeometry args={[18, .16, 24]} /><meshStandardMaterial color="#eef0ea" /></mesh>
+    {[-6, 0, 6].map(x => [-7, 0, 7].map(z => <mesh key={`${x}-${z}`} position={[x, 5.87, z]} rotation={[Math.PI / 2, 0, 0]}><planeGeometry args={[3.2, .55]} /><meshBasicMaterial color="#fffbe8" /></mesh>))}
+    <mesh position={[0, .56, -10.9]}><boxGeometry args={[13.4, 1.1, .9]} /><meshStandardMaterial color="#567477" /></mesh>
+    <mesh position={[0, 1.015, -10.75]}><boxGeometry args={[14, .12, 1.25]} /><meshStandardMaterial color="#34494a" /></mesh>
+    <mesh position={[0, 2.55, -11.5]}><boxGeometry args={[14, .12, .8]} /><meshStandardMaterial color="#435b5d" /></mesh>
+    <Bench x={0} z={BENCH_Z} width={5.5} depth={2.2} />
+    <Bench x={-6.3} z={3.5} width={3.6} depth={5.7} />
+    <Bench x={6.3} z={3.5} width={3.6} depth={5.7} />
+    <Bench x={-6.3} z={-5.4} width={3.6} depth={4.8} />
+    <Bench x={6.3} z={-5.4} width={3.6} depth={4.8} />
+    <Stand x={-2} z={-1.75} /><Stand x={2} z={-1.75} />
+    <Rack x={-1.4} z={-.7} /><Rack x={-6.3} z={3.2} />
+    <group userData={{ labTarget: { type: 'waste' } }} position={[0, 1.15, -.75]}>
+      <mesh><cylinderGeometry args={[.3, .34, .17, 24]} /><meshStandardMaterial color="#778d8b" metalness={.45} /></mesh>
+      <mesh position={[0, .093, 0]}><cylinderGeometry args={[.25, .25, .007, 24]} /><meshStandardMaterial color="#253e42" /></mesh>
+      <mesh position={[0, .112, 0]}><torusGeometry args={[.29, .027, 8, 24]} /><meshStandardMaterial color="#c6d9d2" /></mesh>
+    </group>
+    <group userData={{ labTarget: { type: 'hotplate' } }}>
+      <mesh position={[1.4, 1.14, -.75]}><boxGeometry args={[.7, .2, .62]} /><meshStandardMaterial color="#202c2d" /></mesh>
+      <mesh position={[1.4, 1.25, -.75]}><cylinderGeometry args={[.24, .24, .025, 24]} /><meshStandardMaterial color={hotplateOn ? '#e28e45' : '#a9b0ad'} metalness={.5} emissive={hotplateOn ? '#dc5c16' : '#000000'} emissiveIntensity={hotplateOn ? .8 : 0} /></mesh>
+      <mesh position={[1.64, 1.15, -.49]}><sphereGeometry args={[.04, 10, 8]} /><meshStandardMaterial color={hotplateOn ? '#fb822a' : '#889593'} emissive={hotplateOn ? '#f56b19' : '#000000'} emissiveIntensity={hotplateOn ? 1.2 : 0} /></mesh>
+    </group>
+    {mishap && <pointLight color="#ff893a" position={[0, 2.2, -1.4]} intensity={5} distance={7} />}
+  </>;
+}
+
+function Player() {
+  const { camera } = useThree();
+  const [, get] = useKeyboardControls();
+  const forward = useMemo(() => new THREE.Vector3(), []);
+  const right = useMemo(() => new THREE.Vector3(), []);
+  useFrame((_, delta) => {
+    const keys = get() as Record<string, boolean>;
+    camera.getWorldDirection(forward);
+    forward.y = 0; forward.normalize();
+    right.crossVectors(forward, camera.up).normalize();
+    const movement = new THREE.Vector3();
+    if (keys.forward) movement.add(forward);
+    if (keys.back) movement.sub(forward);
+    if (keys.left) movement.sub(right);
+    if (keys.right) movement.add(right);
+    if (movement.lengthSq() === 0) return;
+    movement.normalize().multiplyScalar(Math.min(delta, .04) * (keys.sprint ? 5 : 3));
+    const nextX = THREE.MathUtils.clamp(camera.position.x + movement.x, -8.1, 8.1);
+    const nextZ = THREE.MathUtils.clamp(camera.position.z + movement.z, -10.5, 10.5);
+    // Walk around benches, not through them. A wider central gap keeps equipment reachable.
+    const blocked = (Math.abs(nextX) < 3.15 && nextZ > -3.05 && nextZ < .25)
+      || (Math.abs(nextX) > 3.95 && ((nextZ > .05 && nextZ < 7.05) || (nextZ > -8.2 && nextZ < -2.6)));
+    if (!blocked) camera.position.set(nextX, 1.67, nextZ);
+  });
+  return null;
+}
+
+function Aiming({ onTarget, targetRef }: {
+  onTarget: (target: Target | null) => void;
+  targetRef: React.RefObject<Target | null>;
+}) {
+  const { camera, scene } = useThree();
+  const ray = useMemo(() => new THREE.Raycaster(), []);
+  const previous = useRef('');
+  useFrame(() => {
+    ray.setFromCamera(new THREE.Vector2(0, 0), camera);
+    ray.far = 3.3;
+    const hits = ray.intersectObjects(scene.children, true);
+    let found: Target | null = null;
+    for (const hit of hits) {
+      let object: THREE.Object3D | null = hit.object;
+      while (object && !object.userData.labTarget) object = object.parent;
+      if (!object) continue;
+      const marked = object.userData.labTarget as { type: 'item'; id: Kind } | { type: 'bench'; bounds: [number, number, number, number] } | { type: 'hotplate' } | { type: 'waste' };
+      found = marked.type === 'item'
+        ? { type: 'item', id: marked.id }
+        : marked.type === 'hotplate' ? { type: 'hotplate' }
+          : marked.type === 'waste' ? { type: 'waste' }
+          : { type: 'bench', point: [hit.point.x, BENCH_Y, hit.point.z], bounds: marked.bounds };
+      break;
+    }
+    targetRef.current = found;
+    const key = found ? found.type === 'item' ? found.id : found.type : '';
+    if (key !== previous.current) { previous.current = key; onTarget(found); }
+  });
+  return null;
+}
+
+function HeldObject({ held, contents, sample, remaining, temperatures }: {
+  held: Kind | null; contents: Record<Vessel, Portion[]>; sample: Portion[]; remaining: Record<Reagent, number>; temperatures: Record<Vessel, number>;
+}) {
+  const { camera } = useThree();
+  const group = useRef<THREE.Group>(null);
+  useFrame(() => {
+    if (!group.current) return;
+    group.current.position.copy(camera.position);
+    group.current.quaternion.copy(camera.quaternion);
+    group.current.translateX(.4);
+    group.current.translateY(-.36);
+    group.current.translateZ(-.85);
+  });
+  if (!held) return null;
+  return <group ref={group} scale={.76}>
+    {REAGENTS.includes(held as Reagent)
+      ? <Bottle item={LOOKUP[held]} remaining={remaining[held as Reagent]} />
+      : <Glassware kind={held as Vessel | 'pipette'} contents={VESSELS.includes(held as Vessel) ? contents[held as Vessel] : []} sample={sample} temperature={VESSELS.includes(held as Vessel) ? temperatures[held as Vessel] : 22} />}
+  </group>;
+}
+
+function World({ positions, contents, remaining, sample, held, temperatures, hotplateOn, mishap, setHotplateOn, setActiveVessel, setPositions, setContents, setRemaining, setSample, setHeld, setMessage, setFocus }: {
+  positions: Record<Kind, Position>;
+  contents: Record<Vessel, Portion[]>;
+  remaining: Record<Reagent, number>;
+  temperatures: Record<Vessel, number>;
+  hotplateOn: boolean;
+  mishap: boolean;
+  setHotplateOn: (value: boolean) => void;
+  setActiveVessel: (value: Vessel) => void;
+  sample: Portion[];
+  held: Kind | null;
+  setPositions: React.Dispatch<React.SetStateAction<Record<Kind, Position>>>;
+  setContents: React.Dispatch<React.SetStateAction<Record<Vessel, Portion[]>>>;
+  setRemaining: React.Dispatch<React.SetStateAction<Record<Reagent, number>>>;
+  setSample: (value: Portion[]) => void;
+  setHeld: (value: Kind | null) => void;
+  setMessage: (value: string) => void;
+  setFocus: (target: Target | null) => void;
+}) {
+  const targetRef = useRef<Target | null>(null);
+  const act = useCallback((target: Target) => {
+    if (mishap) { setMessage('The virtual lab needs a reset before the next experiment.'); return; }
+    if (target.type === 'waste') {
+      if (held === 'pipette' && sample.length) {
+        setSample([]);
+        setMessage(`Emptied ${sample.length} drop${sample.length > 1 ? 's' : ''} from the pipette into the virtual waste station.`);
+      } else if (held && VESSELS.includes(held as Vessel)) {
+        if (!contents[held as Vessel].length) { setMessage('The vessel is already empty.'); return; }
+        setContents(current => ({ ...current, [held]: [] }));
+        setActiveVessel(held as Vessel);
+        setMessage(`${LOOKUP[held].name} emptied into the virtual waste station. The vessel is ready for another experiment.`);
+      } else setMessage('Hold a filled vessel or pipette to empty it into the virtual waste station.');
+      return;
+    }
+    if (target.type === 'hotplate') {
+      if (!held) {
+        setHotplateOn(!hotplateOn);
+        setMessage(`Hotplate switched ${hotplateOn ? 'off' : 'on'}. Place a vessel on the plate to ${hotplateOn ? 'stop' : 'start'} heating.`);
+      } else if (VESSELS.includes(held as Vessel)) {
+        const occupied = VESSELS.some(id => id !== held && positions[id].location === 'bench'
+          && Math.hypot(positions[id].point[0] - 1.4, positions[id].point[2] + .75) < .36);
+        if (occupied) { setMessage('The hotplate is occupied.'); return; }
+        const height = held === 'flask' ? .36 : held === 'test-tube' ? .32 : .31;
+        setPositions(current => ({ ...current, [held]: { location: 'bench', point: [1.4, 1.26 + height, -.75] } }));
+        setActiveVessel(held as Vessel);
+        setHeld(null);
+        setMessage(`${LOOKUP[held].name} placed on the hotplate${hotplateOn ? ' and warming' : '. Switch the plate on to heat it'}.`);
+      } else setMessage('Only a flask, beaker, or test tube can go on the hotplate.');
+      return;
+    }
+    if (target.type === 'bench') {
+      if (!held) return;
+      // Objects are centered on their own geometry; add the exact base-to-center offset.
+      const y = BENCH_Y + (held === 'pipette' ? .12 : held === 'flask' ? .36 : held === 'test-tube' ? .32 : .31);
+      const point: [number, number, number] = [
+        THREE.MathUtils.clamp(target.point[0], target.bounds[0], target.bounds[1]), y,
+        THREE.MathUtils.clamp(target.point[2], target.bounds[2], target.bounds[3]),
+      ];
+      const occupied = Object.entries(positions).some(([id, position]) =>
+        id !== held && position.location === 'bench' &&
+        Math.hypot(position.point[0] - point[0], position.point[2] - point[2]) < .55);
+      if (occupied) { setMessage('That spot is occupied. Aim at a clear part of the worktop.'); return; }
+      const fixtures: [number, number, number][] = [[1.4, -.75, .6], [0, -.75, .55], [-1.4, -.7, .64], [-6.3, 3.2, .65], [-2, -1.75, .52], [2, -1.75, .52]];
+      if (fixtures.some(([x, z, radius]) => Math.hypot(point[0] - x, point[2] - z) < radius)) {
+        setMessage('That spot has fixed equipment. Choose a clear area of the worktop.'); return;
+      }
+      setPositions(current => ({ ...current, [held]: { location: 'bench', point } }));
+      setHeld(null);
+      setMessage(`${LOOKUP[held].name} placed on the worktop. Aim at it and press E to pick it up again.`);
+      return;
+    }
+    const id = target.id;
+    if (!held) {
+      setHeld(id);
+      setPositions(current => ({ ...current, [id]: { ...current[id], location: 'held' } }));
+      setMessage(`Holding ${LOOKUP[id].name}. Aim at the bench to place it.`);
+      return;
+    }
+    if (held === 'pipette') {
+      if (id === 'pipette') return;
+      if (VESSELS.includes(id as Vessel) && sample.length) {
+        if (!availableSpace(id as Vessel, contents[id as Vessel])) {
+          setMessage(`${LOOKUP[id].name} is full. The drops remain in the pipette.`); return;
+        }
+        const drop = sample[sample.length - 1];
+        setContents(current => ({ ...current, [id]: mixPortions([...current[id as Vessel], drop]) }));
+        setActiveVessel(id as Vessel);
+        setSample(sample.slice(0, -1));
+        setMessage(`Dispensed one drop of ${portionNames(drop)} into ${LOOKUP[id].name}. ${sample.length - 1} / ${PIPETTE_CAPACITY} drops remain in the pipette.`);
+      } else if (sample.length >= PIPETTE_CAPACITY) {
+        setMessage(`Pipette is full (${PIPETTE_CAPACITY} drops). Aim at a beaker, flask, or test tube to dispense.`);
+      } else if (REAGENTS.includes(id as Reagent)) {
+        if (remaining[id as Reagent] <= 0) { setMessage('That bottle is empty.'); return; }
+        setRemaining(current => ({ ...current, [id]: current[id as Reagent] - 1 }));
+        setSample(mixPortions([...sample, reagentPortion(id as Reagent)]));
+        setMessage(`Drew one drop from ${LOOKUP[id].name} (${sample.length + 1} / ${PIPETTE_CAPACITY}). Draw again or aim at a vessel to dispense.`);
+      } else if (VESSELS.includes(id as Vessel)) {
+        const liquid = contents[id as Vessel];
+        if (!liquid.length) { setMessage('The vessel is empty.'); return; }
+        const extracted = liquid[liquid.length - 1];
+        setContents(current => ({ ...current, [id]: current[id as Vessel].slice(0, -1) }));
+        setActiveVessel(id as Vessel);
+        setSample(mixPortions([...sample, extracted]));
+        setMessage(`Drew one drop of ${portionNames(extracted)} from ${LOOKUP[id].name} (${sample.length + 1} / ${PIPETTE_CAPACITY}).`);
+      }
+      return;
+    }
+    if (REAGENTS.includes(held as Reagent) && VESSELS.includes(id as Vessel)) {
+      if (remaining[held as Reagent] <= 0) { setMessage('This bottle is empty.'); return; }
+      const poured = Math.min(2, remaining[held as Reagent], availableSpace(id as Vessel, contents[id as Vessel]));
+      if (!poured) { setMessage(`${LOOKUP[id].name} is full. Choose another vessel before pouring.`); return; }
+      setRemaining(current => ({ ...current, [held]: current[held as Reagent] - poured }));
+      setContents(current => ({
+        ...current, [id]: mixPortions([
+          ...current[id as Vessel],
+          ...Array.from({ length: poured }, () => reagentPortion(held as Reagent)),
+        ]),
+      }));
+      setActiveVessel(id as Vessel);
+      setMessage(`Poured ${poured} virtual portion${poured > 1 ? 's' : ''} of ${LOOKUP[held].name} into the ${LOOKUP[id].name}. The bottle is still in your hand.`);
+      return;
+    }
+    if (VESSELS.includes(held as Vessel) && VESSELS.includes(id as Vessel)) {
+      const source = contents[held as Vessel];
+      if (!source.length) { setMessage('The vessel you are holding is empty.'); return; }
+      const amount = Math.min(Math.ceil(source.length / 2), availableSpace(id as Vessel, contents[id as Vessel]));
+      if (!amount) { setMessage(`${LOOKUP[id].name} is full. Nothing was transferred.`); return; }
+      setContents(current => ({
+        ...current, [held]: current[held as Vessel].slice(0, -amount),
+        [id]: mixPortions([...current[id as Vessel], ...current[held as Vessel].slice(-amount)]),
+      }));
+      setActiveVessel(id as Vessel);
+      setMessage(`Transferred ${amount} measured portion${amount > 1 ? 's' : ''} from ${LOOKUP[held].name} to ${LOOKUP[id].name}.`);
+      return;
+    }
+    setMessage('Place the held item on the bench first, or aim at a vessel to pour.');
+  }, [contents, held, hotplateOn, mishap, positions, remaining, sample, setActiveVessel, setContents, setHeld, setHotplateOn, setMessage, setPositions, setRemaining, setSample]);
+
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      if (event.repeat) return;
+      if (event.code === 'KeyE' && targetRef.current) { event.preventDefault(); act(targetRef.current); }
+      if (event.code === 'KeyH' && !mishap) {
+        setHotplateOn(!hotplateOn);
+        setMessage(`Hotplate switched ${hotplateOn ? 'off' : 'on'}.`);
+      }
+      if (event.code === 'KeyQ' && held) {
+        setPositions(current => ({ ...current, [held]: { location: 'shelf', point: LOOKUP[held].shelf } }));
+        setHeld(null);
+        setMessage(`${LOOKUP[held].name} returned to storage.`);
+      }
+    };
+    const click = (event: MouseEvent) => {
+      if (event.target instanceof HTMLCanvasElement && document.pointerLockElement === event.target && targetRef.current) {
+        act(targetRef.current);
+      }
+    };
+    window.addEventListener('keydown', keydown);
+    window.addEventListener('click', click);
+    return () => {
+      window.removeEventListener('keydown', keydown);
+      window.removeEventListener('click', click);
+    };
+  }, [act, held, hotplateOn, mishap, setHeld, setHotplateOn, setMessage, setPositions]);
+
+  return <>
+    <Room hotplateOn={hotplateOn} mishap={mishap} />
+    {ITEMS.map(item => positions[item.id].location !== 'held' &&
+      <LabObject key={item.id} item={item} point={positions[item.id].point}
+        contents={VESSELS.includes(item.id as Vessel) ? contents[item.id as Vessel] : []}
+        sample={item.id === 'pipette' ? sample : []}
+        remaining={REAGENTS.includes(item.id as Reagent) ? remaining[item.id as Reagent] : 0}
+        temperature={VESSELS.includes(item.id as Vessel) ? temperatures[item.id as Vessel] : 22} />)}
+    <HeldObject held={held} contents={contents} sample={sample} remaining={remaining} temperatures={temperatures} />
+    <Player />
+    <Aiming onTarget={setFocus} targetRef={targetRef} />
+    <PointerLockControls />
+  </>;
+}
+
+function canUseWebGL(): boolean {
+  try {
+    const canvas = document.createElement('canvas');
+    return Boolean(canvas.getContext('webgl2') || canvas.getContext('webgl'));
+  } catch { return false; }
+}
+
+export default function Lab3D() {
+  const available = useMemo(canUseWebGL, []);
+  const [entered, setEntered] = useState(false);
+  const [positions, setPositions] = useState(initialPositions);
+  const [contents, setContents] = useState<Record<Vessel, Portion[]>>({ flask: [], beaker: [], 'beaker-2': [], 'test-tube': [] });
+  const [remaining, setRemaining] = useState<Record<Reagent, number>>({ acid: 10, alkali: 10, indicator: 10, copper: 10, silver: 10, salt: 10, bicarb: 10 });
+  const [temperatures, setTemperatures] = useState<Record<Vessel, number>>({ flask: 22, beaker: 22, 'beaker-2': 22, 'test-tube': 22 });
+  const [hotplateOn, setHotplateOn] = useState(false);
+  const [mishap, setMishap] = useState(false);
+  const [activeVessel, setActiveVessel] = useState<Vessel | null>(null);
+  const [history, setHistory] = useState<string[]>(['Simulation ready. Place equipment on the central bench.']);
+  const [discovered, setDiscovered] = useState<string[]>([]);
+  const lastObserved = useRef<Record<Vessel, string>>({ flask: '', beaker: '', 'beaker-2': '', 'test-tube': '' });
+  const [sample, setSample] = useState<Portion[]>([]);
+  const [held, setHeld] = useState<Kind | null>(null);
+  const [focus, setFocus] = useState<Target | null>(null);
+  const [message, setMessage] = useState('Take either beaker from the back counter with E, place it on a worktop, then pick up the pipette to draw and dispense drops.');
+  const [resetKey, setResetKey] = useState(0);
+  const report = useCallback((text: string) => {
+    setMessage(text);
+    setHistory(current => [text, ...current].slice(0, 40));
+  }, []);
+  useEffect(() => {
+    VESSELS.forEach(id => {
+      const label = contents[id].length ? describeReaction(contents[id]).label : '';
+      if (label && label !== lastObserved.current[id]) {
+        setHistory(current => [`Observed in ${LOOKUP[id].name}: ${label}.`, ...current].slice(0, 40));
+        if (['White precipitate', 'Carbon dioxide bubbling', 'Indicator turns pink', 'Indicator turns clear', 'Blue solution'].includes(label)) {
+          setDiscovered(current => current.includes(label) ? current : [...current, label]);
+        }
+      }
+      lastObserved.current[id] = label;
+    });
+  }, [contents]);
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      setTemperatures(current => {
+        const next = { ...current };
+        VESSELS.forEach(id => {
+          const placed = positions[id];
+          const onPlate = placed.location === 'bench' && placed.point[1] > 1.5
+            && Math.hypot(placed.point[0] - 1.4, placed.point[2] + .75) < .36;
+          next[id] = Math.round(hotplateOn && onPlate && contents[id].length
+            ? Math.min(160, current[id] + 9) : Math.max(22, current[id] - 5));
+        });
+        return next;
+      });
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [positions, contents, hotplateOn]);
+  useEffect(() => {
+    if (mishap || !VESSELS.some(id => isRunaway(contents[id], temperatures[id]))) return;
+    setMishap(true);
+    setHotplateOn(false);
+    report('Simulated runaway reaction! The virtual lab is paused. Reset to try another approach.');
+  }, [contents, temperatures, mishap, report]);
+  const usedVessel = activeVessel && contents[activeVessel].length ? activeVessel : VESSELS.find(id => contents[id].length > 0);
+  const reaction = usedVessel ? describeReaction(contents[usedVessel]) : null;
+  const prompt = focus?.type === 'bench'
+    ? held ? `Place ${LOOKUP[held].name} here` : ''
+    : focus?.type === 'waste'
+      ? held === 'pipette' && sample.length > 0 || held && VESSELS.includes(held as Vessel)
+        ? 'Empty into virtual waste station' : 'Virtual waste station'
+    : focus?.type === 'hotplate'
+      ? held ? VESSELS.includes(held as Vessel) ? `Place ${LOOKUP[held].name} on hotplate` : 'Hotplate needs a vessel'
+        : `Switch hotplate ${hotplateOn ? 'off' : 'on'}`
+    : focus?.type === 'item'
+      ? !held ? `Pick up ${LOOKUP[focus.id].name}`
+        : held === 'pipette'
+          ? VESSELS.includes(focus.id as Vessel) && sample.length > 0
+            ? `Dispense 1 drop into ${LOOKUP[focus.id].name}`
+            : focus.id === 'pipette' ? 'Aim at a bottle or vessel'
+              : sample.length >= PIPETTE_CAPACITY ? 'Pipette full · dispense first'
+                : REAGENTS.includes(focus.id as Reagent) || VESSELS.includes(focus.id as Vessel)
+                  ? `Draw 1 drop from ${LOOKUP[focus.id].name}` : 'Aim at a bottle or vessel'
+          : REAGENTS.includes(held as Reagent) && VESSELS.includes(focus.id as Vessel)
+            ? `Pour into ${LOOKUP[focus.id].name}`
+            : VESSELS.includes(held as Vessel) && VESSELS.includes(focus.id as Vessel)
+              ? `Transfer to ${LOOKUP[focus.id].name}` : 'Place held item on bench'
+      : '';
+  const reset = () => {
+    setPositions(initialPositions());
+    setContents({ flask: [], beaker: [], 'beaker-2': [], 'test-tube': [] });
+    setRemaining({ acid: 10, alkali: 10, indicator: 10, copper: 10, silver: 10, salt: 10, bicarb: 10 });
+    setTemperatures({ flask: 22, beaker: 22, 'beaker-2': 22, 'test-tube': 22 });
+    setHotplateOn(false); setMishap(false);
+    setActiveVessel(null);
+    setHistory(['Fresh simulation. All equipment and reagents restored.']);
+    setDiscovered([]);
+    lastObserved.current = { flask: '', beaker: '', 'beaker-2': '', 'test-tube': '' };
+    setSample([]); setHeld(null); setFocus(null); setResetKey(value => value + 1);
+    setMessage('Lab reset. Walk to the back counter to pick up equipment.');
+  };
+  return <main className="vr-lab">
+    {available
+      ? <KeyboardControls map={CONTROLS}>
+          <Canvas key={resetKey} camera={{ position: [0, 1.67, 8.8], fov: 68, near: .05, far: 60 }} gl={{ antialias: true }}>
+            <World positions={positions} contents={contents} remaining={remaining} sample={sample} held={held}
+              te 
+
+.vr-lab { position: fixed; inset: 0; overflow: hidden; background: #111c1e; color: #f4f2e9; font-family: var(--app-font-sans); }
+.vr-lab canvas { position: absolute; inset: 0; width: 100% !important; height: 100% !important; }
+.vr-topbar { position: absolute; z-index: 20; top: 0; left: 0; right: 0; height: 72px; display: flex; align-items: center; justify-content: space-between; padding: 0 28px; border-bottom: 1px solid rgba(255,255,255,.12); background: linear-gradient(180deg, rgba(10,22,24,.94), rgba(10,22,24,.62)); backdrop-filter: blur(10px); pointer-events: none; }
+.vr-brand { display: flex; align-items: center; gap: 11px; }
+.vr-brand > span { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 10px; color: #eaf9f5; background: #18766f; box-shadow: inset 0 0 0 1px rgba(255,255,255,.18); }
+.vr-brand strong, .vr-brand small { display: block; }
+.vr-brand strong { font-size: 13px; letter-spacing: -.01em; }
+.vr-brand small { margin-top: 3px; color: #91aaa8; font: 8px var(--app-font-mono); letter-spacing: .15em; }
+.vr-status { display: flex; align-items: center; gap: 8px; color: #b7d6ce; font: 9px var(--app-font-mono); letter-spacing: .15em; }
+.vr-status i { width: 7px; height: 7px; border-radius: 50%; background: #4ee0a2; box-shadow: 0 0 12px #4ee0a2; }
+.vr-reset { display: flex; align-items: center; gap: 7px; padding: 8px 11px; border: 1px solid rgba(255,255,255,.17); border-radius: 8px; color: #f4f2e9; background: rgba(8,20,22,.72); font-size: 10px; font-weight: 700; pointer-events: auto; }
+.vr-reset:hover { background: rgba(27,92,88,.78); }
+.vr-objective { position: absolute; z-index: 20; top: 92px; left: 24px; width: min(340px, calc(100vw - 48px)); padding: 15px 16px; border: 1px solid rgba(255,255,255,.14); border-radius: 12px; background: rgba(10,24,26,.84); box-shadow: 0 14px 35px rgba(0,0,0,.22); backdrop-filter: blur(10px); pointer-events: none; }
+.vr-objective > span, .vr-readout span { display: block; color: #78c9c0; font: 9px var(--app-font-mono); letter-spacing: .12em; }
+.vr-objective strong { display: block; margin-top: 6px; font-size: 14px; }
+.vr-objective p { margin: 6px 0 0; color: #d1ddda; font-size: 12px; line-height: 1.5; }
+.vr-readout { position: absolute; z-index: 20; top: 92px; right: 24px; display: grid; gap: 8px; width: min(260px, calc(100vw - 48px)); pointer-events: none; }
+.vr-readout > div { padding: 11px 13px; border: 1px solid rgba(255,255,255,.13); border-radius: 9px; background: rgba(10,24,26,.82); backdrop-filter: blur(9px); }
+.vr-readout strong { display: block; margin-top: 5px; font-size: 12px; line-height: 1.4; }
+.vr-journal { position: absolute; z-index: 20; top: 235px; left: 24px; width: min(300px, calc(100vw - 48px)); max-height: min(45vh, 335px); overflow: auto; padding: 14px 16px; border: 1px solid rgba(255,255,255,.14); border-radius: 12px; background: rgba(10,24,26,.84); backdrop-filter: blur(10px); pointer-events: auto; }
+.vr-journal > span { color: #78c9c0; font: 9px var(--app-font-mono); letter-spacing: .15em; }
+.vr-journal p { margin: 9px 0; color: #d4e3e0; font-size: 11px; line-height: 1.5; }
+.vr-journal .vr-mixture { padding: 9px 10px; border-left: 2px solid #73dbc7; color: #e8e6d4; background: rgba(115,219,199,.08); }
+.vr-mixture strong { color: #8ddcca; }
+.vr-journal ol { margin: 10px 0; padding: 0 0 0 17px; color: #b5cbc6; font-size: 10px; line-height: 1.55; }
+.vr-journal li { padding: 3px 0; }
+.vr-journal small { display: block; border-top: 1px solid rgba(255,255,255,.1); padding-top: 8px; color: #87a5a0; font-size: 9px; }
+.vr-field-guide { border-block: 1px solid rgba(255,255,255,.12); padding: 10px 0; }
+.vr-field-guide summary { cursor: pointer; color: #dfd6aa; font-size: 11px; font-weight: 700; }
+.vr-field-guide ul { margin: 9px 0 0; padding: 0; list-style: none; }
+.vr-field-guide li { padding: 7px 0; border-top: 1px solid rgba(255,255,255,.08); color: #aabbb7; }
+.vr-field-guide li.complete { color: #81dfbd; }
+.vr-field-guide li strong { font-size: 10px; }
+.vr-field-guide li small { border: 0; padding: 4px 0 0 16px; }
+.vr-export { width: 100%; margin: 2px 0 12px; padding: 9px 12px; border: 1px solid rgba(115,219,199,.45); border-radius: 7px; color: #b9f6e7; background: rgba(27,92,88,.33); font-size: 11px; font-weight: 700; cursor: pointer; }
+.vr-export:hover { background: rgba(27,92,88,.7); }
+.vr-export:focus-visible, .vr-reset:focus-visible, .vr-entry button:focus-visible, .vr-mishap button:focus-visible, .vr-field-guide summary:focus-visible { outline: 2px solid #e7d87d; outline-offset: 3px; }
+.vr-mishap { position: absolute; z-index: 35; inset: 0; display: grid; place-items: center; padding: 25px; overflow: hidden; background: radial-gradient(circle at center, rgba(223,85,32,.55), rgba(23,19,20,.82) 65%); animation: vr-flash .7s ease-out; }
+.vr-mishap::before { content: ''; position: absolute; width: 55vmin; height: 55vmin; border: 14px solid rgba(255,192,100,.55); border-radius: 50%; box-shadow: 0 0 90px #ef793d, inset 0 0 100px #ef793d; animation: vr-shockwave 1s ease-out forwards; pointer-events: none; }
+.vr-mishap > div { max-width: 410px; padding: 30px; border: 1px solid #f7bb89; border-radius: 16px; color: #fff5e7; background: rgba(34,20,21,.94); text-align: center; box-shadow: 0 0 90px rgba(238,101,36,.36); }
+.vr-mishap > div { position: relative; animation: vr-arrive .45s ease-out both; }
+.vr-mishap strong { color: #ffc08c; font: 10px var(--app-font-mono); letter-spacing: .15em; }
+.vr-mishap h2 { margin: 12px 0; font-size: 30px; }
+.vr-mishap p { color: #e9cbc0; font-size: 12px; line-height: 1.6; }
+.vr-mishap button { margin-top: 15px; padding: 11px 18px; border-radius: 8px; color: #241717; background: #ffc28d; font-weight: 800; cursor: pointer; }
+@keyframes vr-flash { from { background-color: rgba(255,213,120,.95); } to { background-color: transparent; } }
+@keyframes vr-shockwave { from { transform: scale(.1); opacity: 1; } to { transform: scale(3); opacity: 0; } }
+@keyframes vr-arrive { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .vr-mishap, .vr-mishap::before, .vr-mishap > div { animation: none; } .vr-mishap::before { display: none; } }
+.vr-reticle { position: absolute; z-index: 22; left: 50%; top: 50%; width: 22px; height: 22px; transform: translate(-50%, -50%); pointer-events: none; }
+.vr-reticle span { position: absolute; left: 50%; top: 50%; background: rgba(255,255,255,.82); box-shadow: 0 0 5px rgba(0,0,0,.45); transform: translate(-50%, -50%); transition: background .15s ease; }
+.vr-reticle span:first-child { width: 18px; height: 2px; }
+.vr-reticle span:last-child { width: 2px; height: 18px; }
+.vr-reticle.active span { background: #ffe274; }
+.vr-prompt { position: absolute; z-index: 22; left: 50%; top: calc(50% + 30px); display: flex; align-items: center; gap: 8px; transform: translateX(-50%); padding: 7px 10px; border-radius: 7px; color: #fdf8df; background: rgba(8,18,19,.8); font-size: 10px; pointer-events: none; }
+.vr-lab kbd { min-width: 20px; padding: 3px 5px; border: 1px solid rgba(255,255,255,.3); border-bottom-width: 2px; border-radius: 4px; color: #fff; background: rgba(255,255,255,.12); font: 9px var(--app-font-mono); text-align: center; }
+.vr-controls { position: absolute; z-index: 20; left: 50%; bottom: 20px; display: flex; align-items: center; gap: 13px; transform: translateX(-50%); padding: 9px 13px; border: 1px solid rgba(255,255,255,.13); border-radius: 9px; color: #bdcac8; background: rgba(8,20,22,.82); backdrop-filter: blur(9px); font-size: 9px; white-space: nowrap; pointer-events: none; }
+.vr-controls span { display: flex; align-items: center; gap: 5px; }
+.vr-entry { position: absolute; z-index: 40; inset: 0; display: grid; place-items: center; padding: 24px; background: radial-gradient(circle at 50% 42%, rgba(18,78,73,.48), transparent 42%), rgba(5,14,16,.74); backdrop-filter: blur(7px); }
+.vr-entry-card { width: min(470px, 100%); padding: 38px; border: 1px solid rgba(255,255,255,.16); border-radius: 18px; background: linear-gradient(145deg, rgba(20,42,44,.98), rgba(9,24,26,.98)); box-shadow: 0 30px 80px rgba(0,0,0,.38); text-align: center; }
+.vr-entry-icon { width: 60px; height: 60px; display: grid; place-items: center; margin: 0 auto 20px; border-radius: 17px; color: #e9faf5; background: #19756f; box-shadow: 0 12px 30px rgba(20,117,111,.28); }
+.vr-entry-card > span { color: #7bcac1; font: 9px var(--app-font-mono); letter-spacing: .18em; }
+.vr-entry-card h1 { margin: 11px 0 0; font-size: clamp(28px, 5vw, 42px); line-height: 1; letter-spacing: -.055em; }
+.vr-entry-card p { max-width: 390px; margin: 16px auto 0; color: #afbfbd; font-size: 12px; line-height: 1.65; }
+.vr-entry-card button { display: inline-flex; align-items: center; gap: 8px; margin-top: 24px; padding: 12px 18px; border-radius: 9px; color: #08211f; background: #73dbc7; font-size: 12px; font-weight: 800; box-shadow: 0 10px 24px rgba(115,219,199,.18); }
+.vr-entry-card button:hover { background: #9ae8d8; transform: translateY(-1px); }
+.vr-entry-card small { display: block; margin-top: 13px; color: #728d8a; font-size: 9px; }
+.vr-fallback-world { position: absolute; inset: 0; overflow: hidden; background: linear-gradient(180deg, #bdc9c5 0 62%, #76817d 62% 100%); perspective: 900px; }
+.vr-fallback-ceiling { position: absolute; inset: 0 0 68%; display: flex; justify-content: space-around; padding-top: 38px; background: linear-gradient(180deg, #eef0e9, #cbd3cf); transform: rotateX(-20deg); transform-origin: top; }
+.vr-fallback-ceiling i { width: 22%; height: 12px; border-radius: 2px; background: #fffce8; box-shadow: 0 0 22px rgba(255,251,217,.8); }
+.vr-fallback-backwall { position: absolute; left: 18%; right: 18%; top: 23%; bottom: 25%; border: 1px solid rgba(65,84,82,.25); background: repeating-linear-gradient(90deg, transparent 0 79px, rgba(79,98,95,.15) 80px), repeating-linear-gradient(0deg, #dce1dc 0 49px, #c6cfca 50px); }
+.vr-fallback-window { position: absolute; left: 8%; top: 8%; width: 25%; height: 25%; border: 8px solid #657876; background: linear-gradient(135deg, #76b2c0, #b5dcda); box-shadow: inset 0 0 0 2px rgba(255,255,255,.55); }
+.vr-fallback-shelf { position: absolute; left: 10%; right: 8%; top: 43%; height: 9px; display: flex; gap: 15px; align-items: end; padding-left: 42%; background: #455c5d; box-shadow: 0 8px 10px rgba(26,43,43,.25); }
+.vr-fallback-shelf span { display: block; width: 20px; height: 48px; border: 3px solid rgba(255,255,255,.5); border-radius: 5px 5px 8px 8px; }
+.vr-fallback-cabinets { position: absolute; left: 0; right: 0; bottom: 0; height: 32%; display: flex; gap: 5px; padding: 10px; background: #456b6c; }
+.vr-fallback-cabinets i { flex: 1; border: 1px solid rgba(255,255,255,.24); background: linear-gradient(#f0f2ec, #c8d1cd); }
+.vr-fallback-side { position: absolute; top: 25%; bottom: 21%; width: 24%; display: flex; flex-direction: column; gap: 9px; padding: 18px; background: #8d9a96; }
+.vr-fallback-side.left { left: -4%; transform: rotateY(48deg); transform-origin: left; }
+.vr-fallback-side.right { right: -4%; transform: rotateY(-48deg); transform-origin: right; }
+.vr-fallback-side i { flex: 1; border: 1px solid rgba(255,255,255,.2); background: #e2e5df; }
+.vr-fallback-floor { position: absolute; left: -20%; right: -20%; bottom: -32%; height: 65%; background: repeating-linear-gradient(90deg, transparent 0 99px, rgba(37,56,54,.16) 100px), repeating-linear-gradient(0deg, #89938f 0 99px, #74807c 100px); transform: rotateX(67deg); }
+.vr-fallback-bench { position: absolute; z-index: 2; left: 50%; bottom: 13%; width: 38%; height: 31%; transform: translateX(-50%) perspective(800px) rotateX(3deg); border-top: 14px solid #33484a; background: linear-gradient(90deg, #cbd2cf, #eef0ec 50%, #c7cfcc); box-shadow: 0 30px 45px rgba(13,27,28,.35); }
+.vr-fallback-bench::before, .vr-fallback-bench::after { content: ''; position: absolute; bottom: -80px; width: 18px; height: 85px; background: #2f4142; }
+.vr-fallback-bench::before { left: 8%; }.vr-fallback-bench::after { right: 8%; }
+.vr-fallback-bench > span { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); color: #526361; font: 8px var(--app-font-mono); letter-spacing: .12em; text-transform: uppercase; }
+.vr-fallback-glass { position: absolute; left: 50%; top: -50px; display: flex; align-items: end; gap: 28px; transform: translateX(-50%); }
+.vr-fallback-glass i { display: block; width: 42px; height: 70px; border: 3px solid rgba(215,245,242,.7); border-radius: 5px 5px 18px 18px; background: linear-gradient(transparent 45%, rgba(59,161,188,.75) 46%); box-shadow: 0 12px 14px rgba(18,43,45,.22); }
+.vr-fallback-glass i:nth-child(2) { width: 56px; height: 82px; border-radius: 5px 5px 48% 48%; background: linear-gradient(transparent 58%, rgba(211,92,154,.68) 59%); }
+.vr-fallback-glass i:nth-child(3) { width: 19px; height: 74px; border-radius: 5px 5px 12px 12px; background: linear-gradient(transparent 65%, rgba(40,113,204,.72) 66%); }
+.vr-webgl-note { position: absolute; z-index: 30; left: 50%; bottom: 86px; display: grid; gap: 4px; min-width: 300px; transform: translateX(-50%); padding: 10px 14px; border: 1px solid rgba(255,255,255,.15); border-radius: 8px; color: #e6f0ed; background: rgba(9,23,25,.88); text-align: center; }
+.vr-webgl-note strong { font-size: 10px; }.vr-webgl-note span { color: #a8bbb8; font-size: 9px; }
+@media (max-width: 700px) {
+  .vr-topbar { height: 60px; padding: 0 14px; }
+  .vr-brand small, .vr-status { display: none; }
+  .vr-objective { top: 74px; left: 12px; width: calc(100vw - 24px); }
+  .vr-journal { top: 196px; left: 12px; max-height: 25vh; width: min(250px, calc(100vw - 24px)); }
+  .vr-readout { top: auto; right: 12px; bottom: 67px; width: calc(100vw - 24px); grid-template-columns: 1fr 1fr; }
+  .vr-controls { bottom: 10px; max-width: calc(100vw - 20px); overflow: hidden; }
+  .vr-controls span:nth-child(n+3) { display: none; }
+  .vr-entry-card { padding: 28px 22px; }
+}
+{
+  "name": "@workspace/chemistry-lab",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --config vite.config.ts --host 0.0.0.0",
+    "build": "vite build --config vite.config.ts",
+    "serve": "vite preview --config vite.config.ts --host 0.0.0.0",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --experimental-strip-types --test src/lab-reactions.test.ts"
+  },
+  "devDependencies": {
+    "@hookform/resolvers": "^3.10.0",
+    "@react-three/drei": "^10.7.8",
+    "@react-three/fiber": "^9.7.0",
+    "@radix-ui/react-accordion": "^1.2.4",
+    "@radix-ui/react-alert-dialog": "^1.1.7",
+    "@radix-ui/react-aspect-ratio": "^1.1.3",
+    "@radix-ui/react-avatar": "^1.1.4",
+    "@radix-ui/react-checkbox": "^1.1.5",
+    "@radix-ui/react-collapsible": "^1.1.4",
+    "@radix-ui/react-context-menu": "^2.2.7",
+    "@radix-ui/react-dialog": "^1.1.7",
+    "@radix-ui/react-dropdown-menu": "^2.1.7",
+    "@radix-ui/react-hover-card": "^1.1.7",
+    "@radix-ui/react-label": "^2.1.3",
+    "@radix-ui/react-menubar": "^1.1.7",
+    "@radix-ui/react-navigation-menu": "^1.2.6",
+    "@radix-ui/react-popover": "^1.1.7",
+    "@radix-ui/react-progress": "^1.1.3",
+    "@radix-ui/react-radio-group": "^1.2.4",
+    "@radix-ui/react-scroll-area": "^1.2.4",
+    "@radix-ui/react-select": "^2.1.7",
+    "@radix-ui/react-separator": "^1.1.3",
+    "@radix-ui/react-slider": "^1.2.4",
+    "@radix-ui/react-slot": "^1.2.0",
+    "@radix-ui/react-switch": "^1.1.4",
+    "@radix-ui/react-tabs": "^1.1.4",
+    "@radix-ui/react-toast": "^1.2.7",
+    "@radix-ui/react-toggle": "^1.1.3",
+    "@radix-ui/react-toggle-group": "^1.1.3",
+    "@radix-ui/react-tooltip": "^1.2.0",
+    "@replit/vite-plugin-cartographer": "catalog:",
+    "@replit/vite-plugin-dev-banner": "catalog:",
+    "@replit/vite-plugin-runtime-error-modal": "catalog:",
+    "@tailwindcss/typography": "^0.5.15",
+    "@tailwindcss/vite": "catalog:",
+    "@tanstack/react-query": "catalog:",
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@types/three": "^0.186.0",
+    "@vitejs/plugin-react": "catalog:",
+    "@workspace/api-client-react": "workspace:*",
+    "class-variance-authority": "catalog:",
+    "clsx": "catalog:",
+    "cmdk": "^1.1.1",
+    "date-fns": "^3.6.0",
+    "embla-carousel-react": "^8.6.0",
+    "framer-motion": "catalog:",
+    "input-otp": "^1.4.2",
+    "lucide-react": "catalog:",
+    "next-themes": "^0.4.6",
+    "react": "catalog:",
+    "react-day-picker": "^9.11.1",
+    "react-dom": "catalog:",
+    "react-hook-form": "^7.55.0",
+    "react-icons": "^5.4.0",
+    "react-resizable-panels": "^2.1.7",
+    "recharts": "^2.15.2",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "catalog:",
+    "tailwindcss": "catalog:",
+    "three": "^0.186.0",
+    "tw-animate-css": "^1.4.0",
+    "vaul": "^1.1.2",
+    "vite": "catalog:",
+    "wouter": "^3.3.5",
+    "zod": "catalog:"
+  }
+}
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "build", "dist", "**/*.test.ts"],
+  "compilerOptions": {
+    "noEmit": true,
+    "jsx": "preserve",
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "moduleResolution": "bundler",
+    "types": ["node", "vite/client"],
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "references": [
+    {
+      "path": "../../lib/api-client-react"
+    }
+  ]
+}
+
+
